@@ -1,0 +1,17 @@
+{
+  "name": "dangwu-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "当午 · 真太阳时 + 实时昼夜地球（Web/PWA）",
+  "type": "module",
+  "scripts": {
+    "test": "node tests/solar.test.js && node tests/ui.test.js && node tests/search.test.js",
+    "test:ui": "node tests/ui.test.js",
+    "smoke": "node tools/browser-test.mjs",
+    "gen-golden": "node tools/gen-golden.mjs",
+    "verify": "node tools/cross-check.mjs",
+    "check": "node tools/cross-check.mjs && npm test",
+    "serve": "python3 -m http.server 5173 --bind 127.0.0.1"
+  },
+  "license": "MIT"
+}

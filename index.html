@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#04060c">
+<title>当午 · 真太阳时</title>
+<meta name="description" content="以太阳为钟——输入任意经纬度即得真太阳时；首页是一颗实时昼夜交替的地球。">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="src/styles.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/three.module.js",
+    "three/addons/controls/OrbitControls.js": "./vendor/three/addons/controls/OrbitControls.js"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="stage" aria-label="昼夜交替的地球，可拖拽旋转、点击选点"></canvas>
+
+<header class="brand">
+  <h1>当午</h1>
+  <span class="brand__sub">锄禾日当午 · 以太阳为钟</span>
+</header>
+
+<section id="clock" class="clock" aria-live="off">
+  <div class="clock__place">
+    <button id="place-btn" class="clock__name" title="选择地点"></button>
+    <span id="place-coord" class="clock__coord"></span>
+  </div>
+  <div id="tst" class="clock__tst">--:--:--</div>
+  <div class="clock__hint">真太阳时 · 时间基准＝系统时间</div>
+  <div id="sub" class="clock__sub"></div>
+  <div id="sun" class="clock__sun"></div>
+  <div class="clock__bar">
+    <button id="loc-btn" class="btn">定位</button>
+    <button id="search-btn" class="btn">搜索</button>
+    <button id="detail-btn" class="btn">详情</button>
+    <button id="fav-list-btn" class="btn">收藏列表</button>
+    <button id="fav-btn" class="btn btn--primary">收藏此地点</button>
+    <button id="about-btn" class="btn">关于</button>
+  </div>
+</section>
+
+<aside id="pick" class="pick" hidden>
+  <div class="pick__head">
+    <span id="pick-coord"></span>
+    <button id="pick-close" class="pick__close" aria-label="关闭">×</button>
+  </div>
+  <div class="pick__line">真太阳时 <b id="pick-tst"></b> · <span id="pick-shichen"></span></div>
+  <input id="pick-name" class="pick__input" type="text" placeholder="地点名称（如：家）" maxlength="24">
+  <div class="pick__bar">
+    <button id="pick-set" class="btn btn--primary">设为当前地点</button>
+    <button id="pick-save" class="btn">收藏</button>
+  </div>
+</aside>
+
+<section id="search" class="search" hidden aria-label="搜索地点">
+  <div class="search__head">
+    <h2>搜索地点</h2>
+    <button id="search-close" class="icon-btn" aria-label="关闭搜索">×</button>
+  </div>
+  <form id="search-form" class="search__field">
+    <span class="sr-only">搜索城市或国家</span>
+    <input id="search-input" type="search" placeholder="搜索城市或国家" autocomplete="off">
+    <button id="search-online" class="btn" type="submit">联网搜索</button>
+  </form>
+  <div id="search-status" class="search__status" role="status"></div>
+  <ul id="search-results" class="search__results" aria-live="polite"></ul>
+  <p class="attribution">离线城市数据：<a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a> · 在线搜索 © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a></p>
+</section>
+
+<section id="favorites" class="favorites" hidden aria-label="收藏地点">
+  <div class="favorites__head">
+    <div>
+      <h2>收藏地点</h2>
+      <p id="favorites-count">0 个地点</p>
+    </div>
+    <button id="favorites-close" class="icon-btn" aria-label="关闭收藏列表">×</button>
+  </div>
+  <p id="favorites-empty" class="favorites__empty">还没有收藏地点。点击地球或收藏按钮添加。</p>
+  <ul id="favorites-list" class="favorites__list"></ul>
+</section>
+
+<section id="detail" class="detail" hidden aria-label="地点详情">
+  <div class="detail__head">
+    <div>
+      <p class="eyebrow">地点详情</p>
+      <h2 id="detail-name">—</h2>
+      <p id="detail-coord" class="detail__coord"></p>
+    </div>
+    <button id="detail-close" class="icon-btn" aria-label="关闭详情">×</button>
+  </div>
+  <div class="detail__grid">
+    <div class="detail__metric">
+      <span>真太阳时</span>
+      <strong id="detail-tst">--:--</strong>
+    </div>
+    <div class="detail__metric">
+      <span>太阳高度角</span>
+      <strong id="detail-alt">—</strong>
+    </div>
+    <div class="detail__metric">
+      <span>太阳方位角</span>
+      <strong id="detail-az">—</strong>
+    </div>
+    <div class="detail__metric">
+      <span>日长</span>
+      <strong id="detail-day">—</strong>
+    </div>
+    <div class="detail__metric">
+      <span>影长比</span>
+      <strong id="detail-shadow">—</strong>
+    </div>
+    <div class="detail__metric">
+      <span>十二时辰</span>
+      <strong id="detail-shichen">—</strong>
+    </div>
+    <div class="detail__metric">
+      <span>正午高度角</span>
+      <strong id="detail-noon-alt">—</strong>
+    </div>
+  </div>
+  <div id="detail-events" class="detail__events"></div>
+  <div class="detail__actions">
+    <button id="detail-copy" class="btn">复制坐标</button>
+    <button id="detail-compare" class="btn">加入对比</button>
+    <button id="detail-select" class="btn btn--primary">设为当前地点</button>
+  </div>
+</section>
+
+<section id="about" class="detail" hidden aria-label="关于当午">
+  <div class="detail__head">
+    <div><p class="eyebrow">关于</p><h2>当午 1.0.0</h2></div>
+    <button id="about-close" class="icon-btn" aria-label="关闭关于">×</button>
+  </div>
+  <p>以太阳为钟。真太阳时与太阳位置均在设备本地计算，核心功能不上传位置数据。</p>
+  <p>太阳算法基于 NOAA 方法。Web 地球影像源自 NASA Blue Marble / Black Marble（公有领域）与 Solar System Scope 高分辨率纹理（CC BY 4.0）。</p>
+  <p>离线城市索引源自 <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a>，依 CC BY 4.0 使用；在线检索由 <a href="https://nominatim.org/" target="_blank" rel="noopener">Nominatim</a> 提供，数据 © OpenStreetMap contributors。</p>
+  <p>公共搜索服务联系标识：dangwu-app@users.noreply.github.com。</p>
+</section>
+
+<!-- 城市卡片：点击地球上的城市点弹出 -->
+<section id="city-card" class="detail" hidden aria-label="城市信息">
+  <div class="detail__head">
+    <div><p class="eyebrow">城市</p><h2 id="city-name">—</h2></div>
+    <button id="city-close" class="icon-btn" aria-label="关闭">×</button>
+  </div>
+  <div class="detail__grid">
+    <div class="detail__metric"><span>真太阳时</span><strong id="city-tst">—</strong></div>
+    <div class="detail__metric"><span>日出</span><strong id="city-sunrise">—</strong></div>
+    <div class="detail__metric"><span>日落</span><strong id="city-sunset">—</strong></div>
+    <div class="detail__metric"><span>日长</span><strong id="city-daylen">—</strong></div>
+    <div class="detail__metric"><span>时区</span><strong id="city-tz">—</strong></div>
+    <div class="detail__metric"><span>坐标</span><strong id="city-coord">—</strong></div>
+  </div>
+  <div id="city-events" class="detail__events"></div>
+  <div class="detail__actions">
+    <button id="city-fav" class="btn">收藏</button>
+    <button id="city-compare" class="btn btn--primary">加入对比</button>
+    <button id="city-set" class="btn">设为当前地点</button>
+  </div>
+</section>
+
+<!-- 对比栏：底部固定，最多 4 城并列 -->
+<footer id="compare-bar" class="compare-bar" hidden aria-label="城市对比">
+  <div class="compare-bar__inner">
+    <button id="compare-clear" class="compare-bar__clear" aria-label="清空对比">清空</button>
+    <div id="compare-slots" class="compare-bar__slots"></div>
+  </div>
+</footer>
+
+<div id="toast" class="toast" hidden></div>
+<div id="boot" class="boot">载入地球贴图…</div>
+<div id="err" class="err" hidden></div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
