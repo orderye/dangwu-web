@@ -38,15 +38,17 @@ export function eventLines(date, ev, loc, lon, eot) {
 }
 
 export function locationFromSearchResult(result) {
-  return {
-    // GeoNames 本地结果带 geonameId → 稳定 id，对比栏按 id 去重；在线结果无 id，由调用方按坐标去重
-    id: result.geonameId != null ? 'geo:' + result.geonameId : undefined,
+  const loc = {
     name: result.name || '未命名',
     latitude: result.latitude,
     longitude: result.longitude,
     timeZoneId: result.timeZoneId || null,
     tzOffsetMin: result.tzOffsetMin ?? null,
   };
+  // GeoNames 本地结果带 geonameId → 稳定 id，对比栏按 id 去重；
+  // 在线结果无 id，由调用方按坐标去重（不设置键，保持旧对象形状）
+  if (result.geonameId != null) loc.id = 'geo:' + result.geonameId;
+  return loc;
 }
 
 /**

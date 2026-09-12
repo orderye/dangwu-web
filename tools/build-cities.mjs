@@ -10,17 +10,17 @@ const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const TMP = '/tmp/dangwu-geonames';
 const OUTPUT = resolve(ROOT, 'src/data/cities.json');
 const META = resolve(ROOT, 'src/data/cities.meta.json');
-const SNAPSHOT = '2026-09-11';
+const SNAPSHOT = '2026-09-12';
 const SOURCES = {
   cities: {
     url: 'https://download.geonames.org/export/dump/cities15000.zip',
     file: resolve(TMP, 'cities15000.zip'),
-    sha256: '9943935d4169b44736173c48bd494195cf9f776ecff2e9c82bade740165a85c9',
+    sha256: '4f6fd2209a5660fed2989fccc8842947e3107ff595c14efc35ab281bba0ee467',
   },
   aliases: {
     url: 'https://download.geonames.org/export/dump/alternateNamesV2.zip',
     file: resolve(TMP, 'alternateNamesV2.zip'),
-    sha256: 'cd875d6a58e7efc32b9e26154af0c7f88f6e8ec31cd11ce0144d0edcf79d635a',
+    sha256: '2ceb4ce0541112d2121e811253fff7920603922e82d77b63c521df362d507ade',
   },
 };
 
@@ -62,10 +62,23 @@ for await (const line of zippedLines(SOURCES.cities.file, 'cities15000.txt')) {
     aliases: [],
     lat: Number(f[4]),
     lon: Number(f[5]),
+    featureCode: f[7] || '',
     countryCode: f[8],
     population: Number(f[14]) || 0,
     timeZoneId: f[17] || null,
   };
+  // 点位密度规则（光点数量控制）：
+  //   中国大陆：全量保留（≥1.5 万人口）
+  //   港澳台：只保留地级市规模（≥50 万人口）
+  //   国外：只保留首都(PPLC)/一级行政区首府(PPLA)及百万人口以上大城
+  const cc = city.countryCode;
+  if (!['CN'].includes(cc)) {
+    if (['TW', 'HK', 'MO'].includes(cc)) {
+      if (city.population < 5e5) continue;
+    } else if (!['PPLC', 'PPLA'].includes(city.featureCode) && city.population < 1e6) {
+      continue;
+    }
+  }
   const builtIn = f[3].split(',').map((x) => x.trim()).filter(Boolean);
   city.aliases = [...new Set(builtIn.filter((x) => x !== city.name && x !== city.asciiName))].slice(0, 4);
   cities.push(city);

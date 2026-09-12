@@ -102,6 +102,21 @@ export class Globe {
       this.requestRender();
     });
 
+    // 交互期连续渲染（跟手）：拖拽/惯性期间每帧绘制，静止后回落按需渲染。
+    // 按需路径下「事件→rAF→绘制」一帧一跳，阻尼曲线会被采样成锯齿，手感发涩。
+    this._interacting = false;
+    this._loopUntil = 0;
+    this._loopQueued = false;
+    this.controls.addEventListener('start', () => {
+      this._interacting = true;
+      this._startLoop();
+    });
+    this.controls.addEventListener('end', () => {
+      this._interacting = false;
+      this._loopUntil = performance.now() + 900;   // 松手后阻尼惯性收敛窗口
+      this._startLoop();
+    });
+
     this.u = {
       dayTex: { value: null },
       nightTex: { value: null },
@@ -135,12 +150,29 @@ export class Globe {
     this.cityData = null;           // 与 cityPoints 顶点顺序一致的城市数组，用于拾取后查询详情
     this._cityLodCount = 0;
 
+    // 城市名标签层：HTML 覆盖层，随 zoom 分级显示（见 _updateLabels）。
+    // 紧跟在 canvas 之后插入 DOM，保持「canvas < 标签 < 其余 UI」的绘制次序。
+    this.labelLayer = document.createElement('div');
+    this.labelLayer.className = 'globe-labels';
+    this.labelLayer.hidden = true;
+    canvas.insertAdjacentElement('afterend', this.labelLayer);
+    this._labelDivs = new Map();    // cityId -> div（复用节点，避免每帧重建）
+    this._labelTmp = new THREE.Vector3();
+    this._labelCam = new THREE.Vector3();
+
     // 点击拾取：先尝试城市 Points，再拾取地球表面。
     // threshold（世界单位）在 _emitPick 里按相机距离动态缩放。
     this._ray = new THREE.Raycaster();
     this._ray.params.Points = { threshold: 0.01 };
     this._ndc = new THREE.Vector2();
-    canvas.addEventListener('click', (e) => this._emitPick(e.clientX, e.clientY, onPick));
+    // 拖拽松手不应触发拾取：记录按下位置，位移超过阈值视为拖拽
+    this._downAt = null;
+    canvas.addEventListener('pointerdown', (e) => { this._downAt = { x: e.clientX, y: e.clientY }; });
+    canvas.addEventListener('click', (e) => {
+      const d = this._downAt;
+      if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 5) return;
+      this._emitPick(e.clientX, e.clientY, onPick);
+    });
 
     this._queued = false;
     this.requestRender();
@@ -217,14 +249,33 @@ export class Globe {
     this.requestRender();
   }
 
+  /** 连续渲染循环：交互期/惯性期每帧绘制，窗口期过后自动停止 */
+  _startLoop() {
+    if (this._loopQueued) return;
+    this._loopQueued = true;
+    const step = () => {
+      this._loopQueued = false;
+      this.render();
+      if (this._interacting || performance.now() < this._loopUntil) {
+        this._loopQueued = true;
+        requestAnimationFrame(step);
+      }
+    };
+    requestAnimationFrame(step);
+  }
+
   /**
    * 按需绘制：合并同一帧内的多次请求；rAF 优先对齐刷新率，
    * rAF 被挂起时（后台 tab、嵌入式 WebView）用 120ms 定时器兜底，保证仍出帧。
-   * 静止时不持续占用 GPU，省电关键。
+   * 静止时不持续占用 GPU，省电关键；交互期由连续循环接管（见 requestRender 开头）。
    */
   requestRender() {
     this.needsRender = true;
-    if (this._queued) return;
+    if (this._loopQueued) return;
+    if (this._interacting || performance.now() < this._loopUntil) {
+      this._startLoop();
+      return;
+    }
     this._queued = true;
     const draw = () => {
       this._queued = false;
@@ -240,6 +291,7 @@ export class Globe {
     this.needsRender = false;
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
+    this._updateLabels();
   }
 
   /**
@@ -298,6 +350,10 @@ export class Globe {
     this.cityPoints = new THREE.Points(geo, this.cityMat);
     this.cityPoints.renderOrder = 1;  // 在地球之上
     this.scene.add(this.cityPoints);
+    // 数据已更换：丢弃旧标签（数据按人口降序，标签扫描依赖该顺序）
+    for (const div of this._labelDivs.values()) div.remove();
+    this._labelDivs.clear();
+    this.labelLayer.hidden = false;
     this.updateCityLod(true);
     this._updatePointScale();
     this.requestRender();
@@ -326,6 +382,66 @@ export class Globe {
     if (force || Math.abs(k - this._cityLodCount) > Math.max(minCount * 0.05, 1) || k === total) {
       this._cityLodCount = k;
       this.cityPoints.geometry.setDrawRange(0, k);
+    }
+  }
+
+  /**
+   * 城市名标签（放大逻辑）：
+   *   - 人口下限随 zoom 下降：远景（世界视野）只标 ≥600 万的都会，
+   *     最近（城市视野）降到 ≥20 万；数据按人口降序，扫到阈值即停。
+   *   - 数量上限随 zoom 放宽（10 → 44），投影到屏幕后按人口优先贪心放置，
+   *     屏幕空间去重叠，避免标签成糊。
+   *   - 背面城市用地平线判据（cosθ > R/d）剔除；div 节点复用，不逐帧重建。
+   */
+  _updateLabels() {
+    const data = this.cityData;
+    if (!data || !data.length || this.labelLayer.hidden) return;
+    const el = this.renderer.domElement;
+    const w = el.clientWidth, h = el.clientHeight;
+    const dist = this.camera.position.length();
+    const t = THREE.MathUtils.clamp(
+      (this.controls.maxDistance - dist) / (this.controls.maxDistance - this.controls.minDistance), 0, 1);
+    const popFloor = THREE.MathUtils.lerp(6e6, 2e5, t);
+    const maxLabels = Math.round(THREE.MathUtils.lerp(10, 44, t));
+    const camN = this._labelCam.copy(this.camera.position).normalize();
+    const horizon = 1 / dist + 0.03;
+    const placed = [];
+    const shown = new Set();
+    const v = this._labelTmp;
+    const scan = Math.min(data.length, 2000);
+    for (let i = 0; i < scan && placed.length < maxLabels; i++) {
+      const city = data[i];
+      if ((city.population || 0) < popFloor) break;   // 降序数据，后面只会更小
+      const a = city.latitude * Math.PI / 180, o = city.longitude * Math.PI / 180;
+      v.set(Math.cos(a) * Math.cos(o), Math.sin(a), -Math.cos(a) * Math.sin(o));
+      if (v.dot(camN) < horizon) continue;            // 在地球背面
+      v.multiplyScalar(1.001).project(this.camera);
+      if (v.x < -1.02 || v.x > 1.02 || v.y < -1.02 || v.y > 1.02) continue;
+      const x = (v.x * 0.5 + 0.5) * w, y = (-v.y * 0.5 + 0.5) * h;
+      const label = city.nameZh || city.asciiName || city.name;
+      const wd = label.length * (/[^\x00-\xff]/.test(label) ? 12 : 6.5) + 10;
+      let blocked = false;
+      for (const p of placed) {
+        if (Math.abs(p.x - x) < (p.w + wd) / 2 + 4 && Math.abs(p.y - y) < 16) { blocked = true; break; }
+      }
+      if (blocked) continue;
+      placed.push({ x, y, w: wd });
+      shown.add(city.id);
+      let div = this._labelDivs.get(city.id);
+      if (!div) {
+        div = document.createElement('div');
+        div.className = 'globe-label';
+        this.labelLayer.appendChild(div);
+        this._labelDivs.set(city.id, div);
+      }
+      div.textContent = label;
+      div.style.transform = `translate(${x + 6}px, ${y - 8}px)`;
+    }
+    for (const [id, div] of this._labelDivs) {
+      if (!shown.has(id)) {
+        div.remove();
+        this._labelDivs.delete(id);
+      }
     }
   }
 

@@ -397,6 +397,8 @@ function normalizeCities(raw) {
       id: c.geonameId != null ? 'geo:' + c.geonameId : undefined,
       name: c.name,
       asciiName: c.asciiName,
+      // 中文名（取第一个含 CJK 的别名），放大后的地区名标签优先显示
+      nameZh: (c.aliases || []).find((s) => /[\u4e00-\u9fff]/.test(s)) || null,
       aliases: c.aliases,
       countryCode: c.countryCode,
       population: c.population || 0,
