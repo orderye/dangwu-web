@@ -159,6 +159,8 @@ export class Globe {
     this.labelLayer.className = 'globe-labels';
     this.labelLayer.hidden = true;
     canvas.insertAdjacentElement('afterend', this.labelLayer);
+    // 标签层可点击后，光标悬停在城市名上时 wheel 事件目标是标签而非 canvas，需转发
+    this.labelLayer.addEventListener('wheel', (e) => this._zoomToCursor(e), { passive: false });
     this._labelDivs = new Map();    // cityId -> div（复用节点，避免每帧重建）
     this._labelTmp = new THREE.Vector3();
     this._labelCam = new THREE.Vector3();
@@ -280,8 +282,8 @@ export class Globe {
     const cam = this.camera.position;
     const dist = cam.length();
 
-    // 灵敏度与 OrbitControls 默认相近：向上滚（deltaY<0）放大
-    const factor = Math.exp(-e.deltaY * 0.0014);
+    // 灵敏度与 OrbitControls 默认一致：向上滚（deltaY<0）放大、向下滚缩小
+    const factor = Math.exp(e.deltaY * 0.0014);
     const newDist = THREE.MathUtils.clamp(dist * factor, this.controls.minDistance, this.controls.maxDistance);
     if (newDist === dist) return;
     const base = cam.clone().multiplyScalar(newDist / dist);   // 仅视线缩进
