@@ -131,28 +131,59 @@ export class Globe {
       const rect = this.renderer.domElement.getBoundingClientRect();
       const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      const controls = this.controls;
 
-      // 以当前相机姿态拾取地表点
+      // ── 第一步：沿视线缩放（target=球心，视线方向不变）──
       this._ray.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
       const hit = this._ray.intersectObject(this.globe, false)[0];
-      if (!hit) return;   // 光标不在地球上 → 不缩放
+      const hitNdc = hit ? hit.point.clone().project(this.camera) : null;
 
-      const target = hit.point;              // 新的轨道中心
-      const cam = this.camera.position;
-      const curDist = cam.distanceTo(target);
-      const factor = Math.exp(e.deltaY * 0.0014);   // 向上滚放大
-      let newDist = THREE.MathUtils.clamp(curDist * factor,
-                                          this.controls.minDistance,
-                                          this.controls.maxDistance);
-      if (newDist === curDist) return;
+      const dist = this.camera.position.distanceTo(controls.target);
+      const factor = Math.exp(e.deltaY * 0.0014);
+      const newDist = THREE.MathUtils.clamp(dist * factor,
+                                           controls.minDistance, controls.maxDistance);
+      if (newDist === dist) return;
+      // 沿 (相机-target) 方向移动相机，target 不动 → 视线方向完全不变
+      const dir = this.camera.position.clone().sub(controls.target).normalize();
+      this.camera.position.copy(controls.target).addScaledVector(dir, newDist);
 
-      // 以 hit 为中心缩放：相机沿 (cam - target) 方向移动
-      const dir = cam.clone().sub(target).normalize();
-      cam.copy(target).addScaledVector(dir, newDist);
+      // ── 第二步：pan 补偿（相机+target 同步平移），让 hit 点回到原屏幕位置 ──
+      // 纯平移不改变视线方向 → 零旋转零乱滚；拖拽仍绕球心稳定旋转
+      if (hit && hitNdc) {
+        this.camera.updateMatrixWorld();
+        this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+        const v = hit.point.clone().project(this.camera);   // 缩放后 hit 的 NDC
+        const dxN = ndcX - v.x, dyN = ndcY - v.y;
+        if (Math.abs(dxN) > 1e-6 || Math.abs(dyN) > 1e-6) {
+          const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
+          const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
+          const dCam = this.camera.position.distanceTo(hit.point);
+          const halfH = Math.tan(this.camera.fov * Math.PI / 360) * dCam;
+          const halfW = halfH * this.camera.aspect;
+          // 世界空间补偿向量
+          const pan = right.multiplyScalar(dxN * halfW).addScaledVector(up, dyN * halfH);
+          // 逐级收缩：球心投影不漂出视口中部（NDC ≤ 0.55），防止地球飞出屏幕
+          const LIMIT = 0.55;
+          for (const f of [1, 0.7, 0.5, 0.3, 0.15, 0]) {
+            this.camera.position.addScaledVector(pan, f);
+            controls.target.addScaledVector(pan, f);
+            this.camera.updateMatrixWorld();
+            this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+            const o = new THREE.Vector3().copy(controls.target).project(this.camera);
+            if (Math.abs(o.x) <= LIMIT && Math.abs(o.y) <= LIMIT) break;
+            // 回滚本次尝试
+            this.camera.position.addScaledVector(pan, -f);
+            controls.target.addScaledVector(pan, -f);
+          }
+          // target 漂移离球心太远时，拉回球心（牺牲锚定保稳定）
+          const tLen = controls.target.length();
+          if (tLen > 0.5) {
+            controls.target.multiplyScalar(0.5 / tLen);
+          }
+        }
+      }
 
-      // 关键：把轨道中心更新为 hit，后续旋转自然绕该点
-      this.controls.target.copy(target);
-      this.controls.update();
+      controls.update();
       this.updateCityLod();
       this.requestRender();
     };
