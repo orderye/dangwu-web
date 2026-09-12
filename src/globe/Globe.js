@@ -97,28 +97,70 @@ export class Globe {
     this.controls.minDistance = 1.6;          // 8K 贴图下允许更近观察
     this.controls.maxDistance = 7;
     this.controls.enablePan = false;
-    // 自定义指向性缩放：以鼠标所指地表点为中心
-    this.controls.enableZoom = false;   // 关闭内置 zoom，改用下面的 wheel 监听
-    canvas.addEventListener('wheel', (e) => this._zoomToCursor(e), { passive: false });
+    this.controls.enableZoom = false;   // 关闭内置 zoom，统一用 pointer 事件处理
     this.controls.addEventListener('change', () => {
       this.updateCityLod();
       this.requestRender();
     });
 
-    // 交互期连续渲染（跟手）：拖拽/惯性期间每帧绘制，静止后回落按需渲染。
-    // 按需路径下「事件→rAF→绘制」一帧一跳，阻尼曲线会被采样成锯齿，手感发涩。
+    // ── 统一交互层：pointer 事件驱动拖拽/点击/缩放 ──
+    // 标签层 pointer-events: none（CSS），事件穿透到 canvas 统一处理
     this._interacting = false;
     this._loopUntil = 0;
     this._loopQueued = false;
-    this.controls.addEventListener('start', () => {
-      this._interacting = true;
-      this._startLoop();
-    });
-    this.controls.addEventListener('end', () => {
-      this._interacting = false;
-      this._loopUntil = performance.now() + 900;   // 松手后阻尼惯性收敛窗口
-      this._startLoop();
-    });
+    this._downAt = null;
+    this._downTime = 0;
+
+    const onDown = (e) => {
+      this._downAt = { x: e.clientX, y: e.clientY };
+      this._downTime = performance.now();
+    };
+    const onUp = (e) => {
+      const dt = performance.now() - this._downTime;
+      const dx = e.clientX - this._downAt?.x ?? 0;
+      const dy = e.clientY - this._downAt?.y ?? 0;
+      const moved = Math.hypot(dx, dy) > 5;
+      if (!moved && dt < 300) {
+        // 轻触/点击：拾取
+        this._emitPick(e.clientX, e.clientY, onPick);
+      }
+      this._downAt = null;
+    };
+    const onWheel = (e) => {
+      e.preventDefault();
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+      // 以当前相机姿态拾取地表点
+      this._ray.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
+      const hit = this._ray.intersectObject(this.globe, false)[0];
+      if (!hit) return;   // 光标不在地球上 → 不缩放
+
+      const target = hit.point;              // 新的轨道中心
+      const cam = this.camera.position;
+      const curDist = cam.distanceTo(target);
+      const factor = Math.exp(e.deltaY * 0.0014);   // 向上滚放大
+      let newDist = THREE.MathUtils.clamp(curDist * factor,
+                                          this.controls.minDistance,
+                                          this.controls.maxDistance);
+      if (newDist === curDist) return;
+
+      // 以 hit 为中心缩放：相机沿 (cam - target) 方向移动
+      const dir = cam.clone().sub(target).normalize();
+      cam.copy(target).addScaledVector(dir, newDist);
+
+      // 关键：把轨道中心更新为 hit，后续旋转自然绕该点
+      this.controls.target.copy(target);
+      this.controls.update();
+      this.updateCityLod();
+      this.requestRender();
+    };
+
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    // 标签层 CSS pointer-events: none，事件穿透到 canvas 统一处理，无需额外监听
 
     this.u = {
       dayTex: { value: null },
@@ -159,8 +201,6 @@ export class Globe {
     this.labelLayer.className = 'globe-labels';
     this.labelLayer.hidden = true;
     canvas.insertAdjacentElement('afterend', this.labelLayer);
-    // 标签层可点击后，光标悬停在城市名上时 wheel 事件目标是标签而非 canvas，需转发
-    this.labelLayer.addEventListener('wheel', (e) => this._zoomToCursor(e), { passive: false });
     this._labelDivs = new Map();    // cityId -> div（复用节点，避免每帧重建）
     this._labelTmp = new THREE.Vector3();
     this._labelCam = new THREE.Vector3();
@@ -170,41 +210,6 @@ export class Globe {
     this._ray = new THREE.Raycaster();
     this._ray.params.Points = { threshold: 0.01 };
     this._ndc = new THREE.Vector2();
-    // 拖拽松手不应触发拾取：记录按下位置，位移超过阈值视为拖拽
-    this._downAt = null;
-    canvas.addEventListener('pointerdown', (e) => { this._downAt = { x: e.clientX, y: e.clientY }; });
-    canvas.addEventListener('click', (e) => {
-      const d = this._downAt;
-      if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 5) return;
-      this._emitPick(e.clientX, e.clientY, onPick);
-    });
-
-    // 指向性缩放：滚轮以鼠标光标下的地表点为中心
-    // 原理：射线求交点 P，把 P 在屏幕坐标固定，沿视线方向移动相机。
-    canvas.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      const rect = this.renderer.domElement.getBoundingClientRect();
-      this._ndc.set(((e.clientX - rect.left) / rect.width) * 2 - 1,
-                    -((e.clientY - rect.top) / rect.height) * 2 + 1);
-      this._ray.setFromCamera(this._ndc, this.camera);
-      const hit = this._ray.intersectObject(this.globe, false)[0];
-      if (!hit) return;
-      const P = hit.point.clone();          // 世界坐标系下的地表点
-      const dir = this.camera.position.clone().sub(this.controls.target).normalize();
-      const zoomSpeed = 0.0012;             // 滚轮灵敏度，可按需调节
-      const factor = 1 - e.deltaY * zoomSpeed;
-      const newDist = THREE.MathUtils.clamp(this.camera.position.distanceTo(this.controls.target) * factor,
-                                            this.controls.minDistance, this.controls.maxDistance);
-      const newPos = this.controls.target.clone().add(dir.multiplyScalar(newDist));
-      this.camera.position.copy(newPos);
-      // 关键：把 P 投影到新相机下的屏幕坐标，再反投影回世界，得到的新 target 使 P 屏幕位置不变
-      const v = P.clone().project(this.camera);
-      this._ray.setFromCamera(v, this.camera);
-      const hit2 = this._ray.intersectObject(this.globe, false)[0];
-      if (hit2) this.controls.target.copy(hit2.point);
-      this.controls.update();
-      this.requestRender();
-    }, { passive: false });
 
     this._queued = false;
     this.requestRender();
@@ -264,52 +269,6 @@ export class Globe {
     this.controls.target.set(0, 0, 0);
     this.controls.update();
     this.requestRender();
-  }
-
-  /**
-   * 以鼠标所指地表点为轨道中心的缩放：
-   *   1) 射线拾取得到地表点 hit
-   *   2) 把 controls.target 设为 hit，相机自然绕该点缩放
-   *   3) 同时按比例调整相机距离，hit 点屏幕位置完全不动
-   * 无需手动平移相机，视线方向完全稳定，零"乱滚"。
-   */
-  _zoomToCursor(e) {
-    e.preventDefault();
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-
-    // 以当前相机姿态拾取地表点
-    this._ray.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
-    const hit = this._ray.intersectObject(this.globe, false)[0];
-    if (!hit) return;   // 光标不在地球上 → 不缩放
-
-    const target = hit.point;              // 新的轨道中心
-    const cam = this.camera.position;
-    const curDist = cam.distanceTo(target);
-    const factor = Math.exp(e.deltaY * 0.0014);   // 向上滚放大
-    let newDist = THREE.MathUtils.clamp(curDist * factor,
-                                        this.controls.minDistance,
-                                        this.controls.maxDistance);
-    if (newDist === curDist) return;
-
-    // 以 hit 为中心缩放：相机沿 (cam - target) 方向移动
-    const dir = cam.clone().sub(target).normalize();
-    cam.copy(target).addScaledVector(dir, newDist);
-
-    // 关键：把轨道中心更新为 hit，后续旋转自然绕该点
-    this.controls.target.copy(target);
-    this.controls.update();
-    this.updateCityLod();
-    this.requestRender();
-  }
-
-  /** 设定相机位姿并刷新矩阵（project / 基向量依赖） */
-  _applyCam(pos) {
-    this.camera.position.copy(pos);
-    this.camera.updateMatrixWorld();
-    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
-    return this.camera.position;
   }
 
   setTexture(tex, which = 'day') {
