@@ -267,57 +267,38 @@ export class Globe {
   }
 
   /**
-   * 以鼠标所指地表点为不动点的缩放：
-   *   1) 先沿当前视线（相机↔原点）缩进，保持朝向与目标=原点；
-   *   2) 再用相机右/上基向量把该点拉回原屏幕 NDC，实现「鼠标处为中心」。
-   * 锚点补偿会带来横向偏移，多步累积后可能把地球挤出视口——
-   * 因此逐级收缩补偿量，保证球心投影始终留在视口中部（NDC ≤0.55）。
-   * 目标始终锁定原点，后续旋转仍绕球心。
+   * 以鼠标所指地表点为轨道中心的缩放：
+   *   1) 射线拾取得到地表点 hit
+   *   2) 把 controls.target 设为 hit，相机自然绕该点缩放
+   *   3) 同时按比例调整相机距离，hit 点屏幕位置完全不动
+   * 无需手动平移相机，视线方向完全稳定，零"乱滚"。
    */
   _zoomToCursor(e) {
     e.preventDefault();
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-    const cam = this.camera.position;
-    const dist = cam.length();
 
-    // 灵敏度与 OrbitControls 默认一致：向上滚（deltaY<0）放大、向下滚缩小
-    const factor = Math.exp(e.deltaY * 0.0014);
-    const newDist = THREE.MathUtils.clamp(dist * factor, this.controls.minDistance, this.controls.maxDistance);
-    if (newDist === dist) return;
-    const base = cam.clone().multiplyScalar(newDist / dist);   // 仅视线缩进
-
-    // 计算锚点补偿向量 T（把 hit 点拉回原 NDC）
-    const T = new THREE.Vector3();
-    this._applyCam(base);
+    // 以当前相机姿态拾取地表点
     this._ray.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
     const hit = this._ray.intersectObject(this.globe, false)[0];
-    if (hit) {
-      const v = hit.point.clone().project(this.camera);   // 缩放后该点的 NDC
-      const dxN = ndcX - v.x, dyN = ndcY - v.y;
-      if (Math.abs(dxN) > 1e-6 || Math.abs(dyN) > 1e-6) {
-        const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
-        const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
-        const dCam = base.distanceTo(hit.point);
-        const halfH = Math.tan(this.camera.fov * Math.PI / 360) * dCam;   // 视口半高（世界单位）
-        const halfW = halfH * this.camera.aspect;
-        T.copy(right).multiplyScalar(dxN * halfW).addScaledVector(up, dyN * halfH);
-      }
-    }
+    if (!hit) return;   // 光标不在地球上 → 不缩放
 
-    // 逐级收缩补偿量：地球中心漂出视口中部就减补偿，锚定与居中取折中
-    const LIMIT = 0.55;
-    for (const f of [1, 0.7, 0.5, 0.3, 0.15, 0]) {
-      this._applyCam(base).addScaledVector(T, f);
-      const o = new THREE.Vector3(0, 0, 0).project(this.camera);
-      if (Math.abs(o.x) <= LIMIT && Math.abs(o.y) <= LIMIT) break;
-    }
-    // 距原点越界再钳一次（保持方向）
-    const d2 = cam.length() || 1;
-    const clamped = THREE.MathUtils.clamp(d2, this.controls.minDistance, this.controls.maxDistance);
-    cam.multiplyScalar(clamped / d2);
+    const target = hit.point;              // 新的轨道中心
+    const cam = this.camera.position;
+    const curDist = cam.distanceTo(target);
+    const factor = Math.exp(e.deltaY * 0.0014);   // 向上滚放大
+    let newDist = THREE.MathUtils.clamp(curDist * factor,
+                                        this.controls.minDistance,
+                                        this.controls.maxDistance);
+    if (newDist === curDist) return;
 
+    // 以 hit 为中心缩放：相机沿 (cam - target) 方向移动
+    const dir = cam.clone().sub(target).normalize();
+    cam.copy(target).addScaledVector(dir, newDist);
+
+    // 关键：把轨道中心更新为 hit，后续旋转自然绕该点
+    this.controls.target.copy(target);
     this.controls.update();
     this.updateCityLod();
     this.requestRender();
