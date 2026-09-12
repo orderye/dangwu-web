@@ -98,6 +98,10 @@ export class Globe {
     this.controls.maxDistance = 7;
     this.controls.enablePan = false;
     this.controls.enableZoom = false;   // 关闭内置 zoom，统一用 pointer 事件处理
+    // 双指交给自定义捏合缩放：把 TWO 指手势设为 PAN，而 enablePan=false 时
+    // OrbitControls 的两指 touch 路径在起始处直接 return（state 维持 NONE），
+    // 不会自行 dolly/pan，避免与下方 pinch 逻辑重复缩放。
+    this.controls.touches.TWO = 4;   // TOUCH.PAN
     this.controls.addEventListener('change', () => {
       this.updateCityLod();
       this.requestRender();
@@ -131,70 +135,75 @@ export class Globe {
     };
     const onWheel = (e) => {
       e.preventDefault();
-      const rect = this.renderer.domElement.getBoundingClientRect();
-      const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-      const controls = this.controls;
-
-      // ── 第一步：沿视线缩放（target=球心，视线方向不变）──
-      this._ray.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
-      const hit = this._ray.intersectObject(this.globe, false)[0];
-      const hitNdc = hit ? hit.point.clone().project(this.camera) : null;
-
-      const dist = this.camera.position.distanceTo(controls.target);
       const factor = Math.exp(e.deltaY * 0.0014);
-      const newDist = THREE.MathUtils.clamp(dist * factor,
-                                           controls.minDistance, controls.maxDistance);
-      if (newDist === dist) return;
-      // 沿 (相机-target) 方向移动相机，target 不动 → 视线方向完全不变
-      const dir = this.camera.position.clone().sub(controls.target).normalize();
-      this.camera.position.copy(controls.target).addScaledVector(dir, newDist);
-
-      // ── 第二步：pan 补偿（相机+target 同步平移），让 hit 点回到原屏幕位置 ──
-      // 纯平移不改变视线方向 → 零旋转零乱滚；拖拽仍绕球心稳定旋转
-      if (hit && hitNdc) {
-        this.camera.updateMatrixWorld();
-        this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
-        const v = hit.point.clone().project(this.camera);   // 缩放后 hit 的 NDC
-        const dxN = ndcX - v.x, dyN = ndcY - v.y;
-        if (Math.abs(dxN) > 1e-6 || Math.abs(dyN) > 1e-6) {
-          const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
-          const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
-          const dCam = this.camera.position.distanceTo(hit.point);
-          const halfH = Math.tan(this.camera.fov * Math.PI / 360) * dCam;
-          const halfW = halfH * this.camera.aspect;
-          // 世界空间补偿向量
-          const pan = right.multiplyScalar(dxN * halfW).addScaledVector(up, dyN * halfH);
-          // 逐级收缩：球心投影不漂出视口中部（NDC ≤ 0.55），防止地球飞出屏幕
-          const LIMIT = 0.55;
-          for (const f of [1, 0.7, 0.5, 0.3, 0.15, 0]) {
-            this.camera.position.addScaledVector(pan, f);
-            controls.target.addScaledVector(pan, f);
-            this.camera.updateMatrixWorld();
-            this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
-            const o = new THREE.Vector3().copy(controls.target).project(this.camera);
-            if (Math.abs(o.x) <= LIMIT && Math.abs(o.y) <= LIMIT) break;
-            // 回滚本次尝试
-            this.camera.position.addScaledVector(pan, -f);
-            controls.target.addScaledVector(pan, -f);
-          }
-          // target 漂移离球心太远时，拉回球心（牺牲锚定保稳定）
-          const tLen = controls.target.length();
-          if (tLen > 0.5) {
-            controls.target.multiplyScalar(0.5 / tLen);
-          }
-        }
-      }
-
-      controls.update();
-      this.updateCityLod();
-      this._recordSnapshot();
-      this.requestRender();
+      this.zoomBy(factor, e.clientX, e.clientY);
     };
 
-    canvas.addEventListener('pointerdown', onDown);
-    canvas.addEventListener('pointerup', onUp);
+    // ── 双指捏合缩放（移动端）──
+    // 复用 Pointer Events：维护 activePointers 映射，两指时按间距比驱动连续缩放。
+    // 单指交由 OrbitControls 旋转；双指时我们自己处理缩放并屏蔽其默认 DOLLY_PAN。
+    this._pointers = new Map();
+    this._pinchDist = 0;
+    this._pinchLastSpan = 0;   // 去重：双指时每根手指各发一次 pointermove，按跨度去重只处理一次
+    this._wasControlsEnabled = true;
+    const onPointerDown = (e) => {
+      this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this._pointers.size === 2) {
+        this._pinchDist = this._twoFingerSpan();
+        this._pinchLastSpan = 0;
+        // 双指进场：彻底禁用 OrbitControls，防止其任何触摸处理干扰
+        this._wasControlsEnabled = this.controls.enabled;
+        this.controls.enabled = false;
+        this._downAt = null;
+      }
+    };
+    const onPointerMove = (e) => {
+      if (!this._pointers.has(e.pointerId)) return;
+      this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this._pointers.size === 2 && this._pinchDist > 0) {
+        const span = this._twoFingerSpan();
+        if (span === this._pinchLastSpan) return;   // 同一步长已处理（另一根手指的 move）
+        this._pinchLastSpan = span;
+        // 张开放大（距离变小）→ factor 取 初始/当前：<1；收拢缩小 → >1
+        const ratio = this._pinchDist / span;
+        if (ratio > 0 && Math.abs(ratio - 1) > 1e-4) {
+          // 以两指中点为锚点缩放，保持手势中心下的地表位置
+          const mid = this._twoFingerMid();
+          this.zoomBy(ratio, mid.x, mid.y);
+          this._pinchDist = span;
+        }
+      }
+    };
+    const onPointerUpAll = (e) => {
+      this._pointers.delete(e.pointerId);
+      if (this._pointers.size < 2) {
+        // 恢复 OrbitControls，但放到下一个微任务，避免当前事件循环中 OrbitControls 处理残留的 pointerup
+        Promise.resolve().then(() => {
+          this.controls.enabled = this._wasControlsEnabled;
+        });
+        this._pinchDist = 0;
+        this._pinchLastSpan = 0;
+      }
+    };
+
+    // 双击放大 / 缩小：在档位表间 ±1 档（无捏合设备也能用）
+    let lastTap = 0;
+    const onDblClick = (e) => {
+      e.preventDefault();
+      const idx = this.activeZoomIndex();
+      const base = idx == null ? this._nearestLevelIndex() : idx;
+      // 双击放大（+1 档）；Shift+双击或三指缩小留给未来，这里统一放大，缩小用捏合/档位按钮
+      this.setZoomLevel(Math.min(base + 1, Globe.ZOOM_LEVELS.length - 1));
+    };
+
+    canvas.addEventListener('pointerdown', (e) => { onDown(e); onPointerDown(e); });
+    // 捕获阶段清理 OrbitControls 状态，比其冒泡阶段的 pointerup 先运行
+    canvas.addEventListener('pointerup', (e) => { onPointerUpAll(e); }, { capture: true });
+    canvas.addEventListener('pointerup', (e) => { onUp(e); });
+    canvas.addEventListener('pointercancel', onPointerUpAll);
+    canvas.addEventListener('pointermove', onPointerMove, { passive: true });
     canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('dblclick', onDblClick);
     // 标签层 CSS pointer-events: none，事件穿透到 canvas 统一处理，无需额外监听
 
     this.u = {
@@ -406,6 +415,89 @@ export class Globe {
     const d = this.getDistance();
     const hit = Globe.ZOOM_LEVELS.findIndex((l) => Math.abs(THREE.MathUtils.clamp(l.distance, this.controls.minDistance, this.controls.maxDistance) - d) < 0.02);
     return hit >= 0 ? hit : null;
+  }
+
+  /** 距离最近档位（用于双击放大找不到精确档位时的基准） */
+  _nearestLevelIndex() {
+    const d = this.getDistance();
+    let best = 0, bestErr = Infinity;
+    Globe.ZOOM_LEVELS.forEach((l, i) => {
+      const dd = THREE.MathUtils.clamp(l.distance, this.controls.minDistance, this.controls.maxDistance);
+      const err = Math.abs(dd - d);
+      if (err < bestErr) { bestErr = err; best = i; }
+    });
+    return best;
+  }
+
+  /** 双指捏合的两指间距（像素） */
+  _twoFingerSpan() {
+    const pts = [...this._pointers.values()];
+    return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+  }
+
+  /** 双指中点（屏幕坐标） */
+  _twoFingerMid() {
+    const pts = [...this._pointers.values()];
+    return { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+  }
+
+  /**
+   * 以屏幕 (clientX, clientY) 为锚点缩放：factor>1 放大、<1 缩小。
+   * 先沿视线改相机距离（视线方向不变），再做 pan 补偿让锚点下的地表回到原屏幕位置，
+   * 避免「放大时地球向手指滑走」。缩放手势（滚轮/捏合）与双击共用本方法。
+   */
+  zoomBy(factor, clientX, clientY) {
+    const clamped = THREE.MathUtils.clamp(factor, 0.2, 5);
+    const controls = this.controls;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const nx = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const ny = -((clientY - rect.top) / rect.height) * 2 + 1;
+
+    // ── 第一步：沿视线缩放（target=球心，视线方向不变）──
+    this._ray.setFromCamera({ x: nx, y: ny }, this.camera);
+    const hit = this._ray.intersectObject(this.globe, false)[0];
+    const hitNdc = hit ? hit.point.clone().project(this.camera) : null;
+
+    const dist = this.camera.position.distanceTo(controls.target);
+    const newDist = THREE.MathUtils.clamp(dist * clamped,
+                                         controls.minDistance, controls.maxDistance);
+    if (newDist === dist) return;
+    const dir = this.camera.position.clone().sub(controls.target).normalize();
+    this.camera.position.copy(controls.target).addScaledVector(dir, newDist);
+
+    // ── 第二步：pan 补偿（相机+target 同步平移），让锚点回到原屏幕位置 ──
+    if (hit && hitNdc) {
+      this.camera.updateMatrixWorld();
+      this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+      const v = hit.point.clone().project(this.camera);
+      const dxN = nx - v.x, dyN = ny - v.y;
+      if (Math.abs(dxN) > 1e-6 || Math.abs(dyN) > 1e-6) {
+        const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
+        const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
+        const dCam = this.camera.position.distanceTo(hit.point);
+        const halfH = Math.tan(this.camera.fov * Math.PI / 360) * dCam;
+        const halfW = halfH * this.camera.aspect;
+        const pan = right.multiplyScalar(dxN * halfW).addScaledVector(up, dyN * halfH);
+        const LIMIT = 0.55;
+        for (const f of [1, 0.7, 0.5, 0.3, 0.15, 0]) {
+          this.camera.position.addScaledVector(pan, f);
+          controls.target.addScaledVector(pan, f);
+          this.camera.updateMatrixWorld();
+          this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+          const o = new THREE.Vector3().copy(controls.target).project(this.camera);
+          if (Math.abs(o.x) <= LIMIT && Math.abs(o.y) <= LIMIT) break;
+          this.camera.position.addScaledVector(pan, -f);
+          controls.target.addScaledVector(pan, -f);
+        }
+        const tLen = controls.target.length();
+        if (tLen > 0.5) controls.target.multiplyScalar(0.5 / tLen);
+      }
+    }
+
+    controls.update();
+    this.updateCityLod();
+    this._recordSnapshot();
+    this.requestRender();
   }
 
   setTexture(tex, which = 'day') {

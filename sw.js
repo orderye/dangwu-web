@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v5';   // v5：新增地球放大倍数档位控件
+const CACHE_VERSION = 'v6';   // v6：移动端适配（捏合缩放、横排放大条、PWA 增强）
 const CORE_CACHE = `dangwu-${CACHE_VERSION}-core`;
 const ASSET_CACHE = `dangwu-${CACHE_VERSION}-assets`;
 const GEOCODE_CACHE = `dangwu-${CACHE_VERSION}-geocode`;

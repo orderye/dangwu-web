@@ -385,6 +385,10 @@ document.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('resize', () => globe?.resize(innerWidth, innerHeight));
+// 移动端旋转屏幕后，浏览器地址栏/安全区重排需等布局稳定；延迟一帧再重设尺寸
+window.addEventListener('orientationchange', () => {
+  setTimeout(() => globe?.resize(innerWidth, innerHeight), 300);
+});
 
 // ── 放大倍数档位控件 ─────────────────────────────────────
 /**
