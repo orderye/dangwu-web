@@ -282,6 +282,8 @@ export class Globe {
     this.camera.aspect = w / Math.max(h, 1);
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h, false);
+    // 地球显示在中部偏左上（右侧留给时间面板）：视口向右下偏移 → 球体向左上偏移
+    this.camera.setViewOffset(w, h, w * 0.09, h * 0.05, w, h);
     this._updatePointScale();
     this.requestRender();
   }
