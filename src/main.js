@@ -386,6 +386,31 @@ document.addEventListener('keydown', (e) => {
 
 window.addEventListener('resize', () => globe?.resize(innerWidth, innerHeight));
 
+// ── 放大倍数档位控件 ─────────────────────────────────────
+/**
+ * 点击档位 → 相机沿当前视线方向移动到目标距离（朝向保持不变）。
+ * 用户用滚轮/拖拽改变机位后，当前最近的档位会自动高亮。
+ */
+function initZoomControls(globeInstance) {
+  const buttons = [...document.querySelectorAll('.zoom__btn')];
+  setZoomActive(globeInstance.activeZoomIndex() ?? -1);
+  buttons.forEach((b) => {
+    b.addEventListener('click', () => {
+      const i = Number(b.dataset.level);
+      globeInstance.setZoomLevel(i);
+      setZoomActive(i);
+    });
+  });
+}
+
+let zoomActiveIndex = -1;
+function setZoomActive(index) {
+  if (index === zoomActiveIndex) return;
+  zoomActiveIndex = index;
+  document.querySelectorAll('.zoom__btn').forEach((b, i) =>
+    b.classList.toggle('is-active', i === index));
+}
+
 // ── 启动 ─────────────────────────────────────────────────
 /**
  * 城市数据归一化：cities.json（GeoNames 导出）用 lat/lon/geonameId，
@@ -431,6 +456,16 @@ function boot() {
 
   // 城市点击回调
   globe.onCityPick((city) => openCityCard(city));
+
+  // 放大倍数档位：按钮切换 + 滚轮/手动缩放后同步高亮
+  initZoomControls(globe);
+  globe.onViewChange = (index) => setZoomActive(index ?? -1);
+
+  // 仅测试钩子：browser-test.mjs 以 ?test=1 打开页面时暴露相机状态，便于断言精确倍数
+  if (location.search.includes('test=1')) {
+    window.__dangwuCamDist = () => globe.getDistance();
+    window.__dangwuZoomLevels = Globe.ZOOM_LEVELS.map(l => l.factor);
+  }
 
   // 恢复持久化的对比栏
   renderCompareBar();

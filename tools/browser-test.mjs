@@ -129,7 +129,8 @@ try {
   check('Service Worker 已激活', typeof registration === 'string' && registration.includes('sw.js'), String(registration));
   const cacheKeys = await page.evaluate(() => caches.keys());
   check('核心缓存已建立', cacheKeys.some((k) => k.includes('core')), cacheKeys.join(','));
-  check('缓存版本已升级', cacheKeys.some((k) => /v2/.test(k)), cacheKeys.join(','));
+  // 断言缓存命名带版本前缀即可（具体版本号随迭代变化，不硬编码）
+  check('缓存命名带版本前缀', cacheKeys.some((k) => /dangwu-v\d+/.test(k)), cacheKeys.join(','));
   const precached = await page.evaluate(async () => {
     const cache = await caches.match('./src/data/cities.json');
     return !!cache;

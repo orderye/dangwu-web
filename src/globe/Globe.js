@@ -94,7 +94,7 @@ export class Globe {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.rotateSpeed = 0.45;
-    this.controls.minDistance = 1.6;          // 8K 贴图下允许更近观察
+    this.controls.minDistance = 7 / 12;       // = 0.5833；保证 12× 档为精确倍数，8K 贴图支撑该距离观察
     this.controls.maxDistance = 7;
     this.controls.enablePan = false;
     this.controls.enableZoom = false;   // 关闭内置 zoom，统一用 pointer 事件处理
@@ -102,6 +102,9 @@ export class Globe {
       this.updateCityLod();
       this.requestRender();
     });
+    // 只记录用户手动转出的朝向（松手那一刻取终值），避免内置 damping 每次 change 都触发
+    canvas.addEventListener('pointerup', () => { if (this._downAt) this._recordSnapshot(); });
+    canvas.addEventListener('pointercancel', () => { if (this._downAt) this._recordSnapshot(); });
 
     // ── 统一交互层：pointer 事件驱动拖拽/点击/缩放 ──
     // 标签层 pointer-events: none（CSS），事件穿透到 canvas 统一处理
@@ -185,6 +188,7 @@ export class Globe {
 
       controls.update();
       this.updateCityLod();
+      this._recordSnapshot();
       this.requestRender();
     };
 
@@ -299,7 +303,109 @@ export class Globe {
     this.camera.position.copy(p);
     this.controls.target.set(0, 0, 0);
     this.controls.update();
+    this._snapshot();
     this.requestRender();
+  }
+
+  /**
+   * 保存当前机位（视角朝向 + 相对球心距离），供 setZoomLevel 恢复。
+   * 档位切换只改「离多远」，不重置用户拖出来的朝向。
+   */
+  _snapshot() {
+    this._snap = {
+      dir: this.camera.position.clone().sub(this.controls.target).normalize(),
+      dist: this.camera.position.distanceTo(this.controls.target),
+    };
+  }
+
+  /** 用户交互后回调：刷新机位快照 + 通知外部（档位高亮） */
+  _onUserViewChange() {
+    this._snapshot();
+    if (this.onViewChange) this.onViewChange(this.activeZoomIndex());
+  }
+
+  /** 仅刷新机位快照（拖动松手时记录朝向终值） */
+  _recordSnapshot() {
+    this._snapshot();
+    if (this.onViewChange) this.onViewChange(this.activeZoomIndex());
+  }
+
+  getDistance() {
+    return this.camera.position.distanceTo(this.controls.target);
+  }
+
+  /**
+   * 放大档位（倍数 = 相对地球完整可见时的放大系数）。
+   * 档位只改相机到球心的距离：朝向（含用户手动拖拽出的角度）保持不变，
+   * 只把 target 重新拉回球心，从而不引入额外旋转。
+   * 距离 = 7 / factor，下限由 controls.minDistance 钳制。
+   */
+  static ZOOM_LEVELS = [
+    { label: '2×', factor: 2.0, distance: 7 / 2 },
+    { label: '3×', factor: 3.0, distance: 7 / 3 },
+    { label: '4×', factor: 4.0, distance: 7 / 4 },
+    { label: '6×', factor: 6.0, distance: 7 / 6 },
+    { label: '8×', factor: 8.0, distance: 7 / 8 },
+    { label: '12×', factor: 12.0, distance: 7 / 12 },
+  ];
+
+  setZoomLevel(index, instant = false) {
+    if (!this._snap) this._snapshot();
+    const level = Globe.ZOOM_LEVELS[index];
+    if (!level) return;
+    const targetDist = THREE.MathUtils.clamp(level.distance, this.controls.minDistance, this.controls.maxDistance);
+    const t0 = performance.now();
+    // OrbitControls.update() 以 camera.position 为输入重算位置，
+    // 故「设 camera.position → 清 target → update()」即可改变半径而不影响朝向。
+    // damping 开启时 update() 还会叠加上次拖拽/滚轮的残留增量（sphericalDelta、scale），
+    // 使结果不确定；切档期间临时关闭，保证动画收敛到精确距离。
+    const apply = (d) => {
+      this.controls.enableDamping = false;
+      this.controls.target.set(0, 0, 0);
+      this.camera.position.copy(this._snap.dir).multiplyScalar(d);
+      this.controls.update();
+      this.controls.enableDamping = true;
+      this._snap.dist = d;
+    };
+    const start = this.getDistance();
+    if (instant || Math.abs(targetDist - start) < 1e-4) {
+      apply(targetDist);
+      this.updateCityLod();
+      this.requestRender();
+      return;
+    }
+    // 短动画：220ms easeOutCubic，避免整屏瞬移。
+    // 动画进度挂在渲染循环上（_startLoop 每帧 render → render 检测 _zoomT0 推进），
+    // 而不是另起一条 rAF 链：按需渲染在静止页面时 rAF 可能被节流，独立链只跑一两帧。
+    this._zoomStart = t0;
+    this._zoomFrom = start;
+    this._zoomTo = targetDist;
+    this._zoomApply = apply;
+    this._loopUntil = performance.now() + 300;
+    this._zoomActive = true;
+    this._startLoop();
+    this.requestRender();
+  }
+
+  /** 由 render() 每帧调用：推进档位动画到目标距离 */
+  _stepZoom() {
+    if (!this._zoomActive) return false;
+    const t = Math.min((performance.now() - this._zoomStart) / 220, 1);
+    const eased = 1 - Math.pow(1 - t, 3);
+    this._zoomApply(THREE.MathUtils.lerp(this._zoomFrom, this._zoomTo, eased));
+    if (t >= 1) {
+      this._zoomActive = false;
+      this._zoomApply = null;
+      return true;   // 刚结束，需要一次收尾渲染
+    }
+    return false;
+  }
+
+  /** 当前距离对应的最近档位数，用于按钮高亮（非精确档位时为 null） */
+  activeZoomIndex() {
+    const d = this.getDistance();
+    const hit = Globe.ZOOM_LEVELS.findIndex((l) => Math.abs(THREE.MathUtils.clamp(l.distance, this.controls.minDistance, this.controls.maxDistance) - d) < 0.02);
+    return hit >= 0 ? hit : null;
   }
 
   setTexture(tex, which = 'day') {
@@ -359,9 +465,14 @@ export class Globe {
   render() {
     if (!this.needsRender) return;
     this.needsRender = false;
-    this.controls.update();
+    // 档位动画期间由 _stepZoom 推进相机到精确目标距离；
+    // 此时跳过 controls.update()，否则其 damping 残留会把相机拉离动画位置。
+    const zoomDone = this._zoomActive ? this._stepZoom() : false;
+    if (!this._zoomActive) this.controls.update();
     this.renderer.render(this.scene, this.camera);
     this._updateLabels();
+    // 动画推进后继续出帧，直到收敛到目标距离
+    if (this._zoomActive || zoomDone) this.requestRender();
   }
 
   /**

@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v4';
+const CACHE_VERSION = 'v5';   // v5：新增地球放大倍数档位控件
 const CORE_CACHE = `dangwu-${CACHE_VERSION}-core`;
 const ASSET_CACHE = `dangwu-${CACHE_VERSION}-assets`;
 const GEOCODE_CACHE = `dangwu-${CACHE_VERSION}-geocode`;
