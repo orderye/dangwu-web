@@ -97,6 +97,9 @@ export class Globe {
     this.controls.minDistance = 1.6;          // 8K 贴图下允许更近观察
     this.controls.maxDistance = 7;
     this.controls.enablePan = false;
+    // 自定义指向性缩放：以鼠标所指地表点为中心
+    this.controls.enableZoom = false;   // 关闭内置 zoom，改用下面的 wheel 监听
+    canvas.addEventListener('wheel', (e) => this._zoomToCursor(e), { passive: false });
     this.controls.addEventListener('change', () => {
       this.updateCityLod();
       this.requestRender();
@@ -174,6 +177,33 @@ export class Globe {
       this._emitPick(e.clientX, e.clientY, onPick);
     });
 
+    // 指向性缩放：滚轮以鼠标光标下的地表点为中心
+    // 原理：射线求交点 P，把 P 在屏幕坐标固定，沿视线方向移动相机。
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      this._ndc.set(((e.clientX - rect.left) / rect.width) * 2 - 1,
+                    -((e.clientY - rect.top) / rect.height) * 2 + 1);
+      this._ray.setFromCamera(this._ndc, this.camera);
+      const hit = this._ray.intersectObject(this.globe, false)[0];
+      if (!hit) return;
+      const P = hit.point.clone();          // 世界坐标系下的地表点
+      const dir = this.camera.position.clone().sub(this.controls.target).normalize();
+      const zoomSpeed = 0.0012;             // 滚轮灵敏度，可按需调节
+      const factor = 1 - e.deltaY * zoomSpeed;
+      const newDist = THREE.MathUtils.clamp(this.camera.position.distanceTo(this.controls.target) * factor,
+                                            this.controls.minDistance, this.controls.maxDistance);
+      const newPos = this.controls.target.clone().add(dir.multiplyScalar(newDist));
+      this.camera.position.copy(newPos);
+      // 关键：把 P 投影到新相机下的屏幕坐标，再反投影回世界，得到的新 target 使 P 屏幕位置不变
+      const v = P.clone().project(this.camera);
+      this._ray.setFromCamera(v, this.camera);
+      const hit2 = this._ray.intersectObject(this.globe, false)[0];
+      if (hit2) this.controls.target.copy(hit2.point);
+      this.controls.update();
+      this.requestRender();
+    }, { passive: false });
+
     this._queued = false;
     this.requestRender();
   }
@@ -231,6 +261,53 @@ export class Globe {
     this.camera.position.copy(p);
     this.controls.target.set(0, 0, 0);
     this.controls.update();
+    this.requestRender();
+  }
+
+  /**
+   * 以鼠标所指地表点为不动点的缩放：
+   *   1) 先沿当前视线（相机↔原点）缩进，保持朝向与目标=原点；
+   *   2) 再用相机右/上基向量把该点拉回原屏幕 NDC，实现「鼠标处为中心」。
+   * 目标始终锁定原点，后续旋转仍绕球心；相机横向偏移等价于一次微旋转，
+   * 且被 min/maxDistance 钳制，不会漂出范围。
+   */
+  _zoomToCursor(e) {
+    e.preventDefault();
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    const cam = this.camera.position;
+    const dist = cam.length();
+
+    // 灵敏度与 OrbitControls 默认相近：向上滚（deltaY<0）放大
+    const factor = Math.exp(-e.deltaY * 0.0014);
+    let newDist = THREE.MathUtils.clamp(dist * factor, this.controls.minDistance, this.controls.maxDistance);
+    if (newDist === dist) return;
+    cam.multiplyScalar(newDist / dist);
+
+    this.camera.updateMatrixWorld();
+    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+
+    this._ray.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
+    const hit = this._ray.intersectObject(this.globe, false)[0];
+    if (hit) {
+      const v = hit.point.clone().project(this.camera);   // 缩放后该点的 NDC
+      const dxN = ndcX - v.x, dyN = ndcY - v.y;
+      if (Math.abs(dxN) > 1e-6 || Math.abs(dyN) > 1e-6) {
+        const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
+        const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
+        const dCam = cam.distanceTo(hit.point);
+        const halfH = Math.tan(this.camera.fov * Math.PI / 360) * dCam;   // 视口半高（世界单位）
+        const halfW = halfH * this.camera.aspect;
+        cam.add(right.multiplyScalar(dxN * halfW));
+        cam.add(up.multiplyScalar(dyN * halfH));
+        const d2 = cam.length() || 1;
+        const clamped = THREE.MathUtils.clamp(d2, this.controls.minDistance, this.controls.maxDistance);
+        cam.multiplyScalar(clamped / d2);
+      }
+    }
+    this.controls.update();
+    this.updateCityLod();
     this.requestRender();
   }
 
