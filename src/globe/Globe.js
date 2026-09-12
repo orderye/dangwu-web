@@ -268,8 +268,9 @@ export class Globe {
    * 以鼠标所指地表点为不动点的缩放：
    *   1) 先沿当前视线（相机↔原点）缩进，保持朝向与目标=原点；
    *   2) 再用相机右/上基向量把该点拉回原屏幕 NDC，实现「鼠标处为中心」。
-   * 目标始终锁定原点，后续旋转仍绕球心；相机横向偏移等价于一次微旋转，
-   * 且被 min/maxDistance 钳制，不会漂出范围。
+   * 锚点补偿会带来横向偏移，多步累积后可能把地球挤出视口——
+   * 因此逐级收缩补偿量，保证球心投影始终留在视口中部（NDC ≤0.55）。
+   * 目标始终锁定原点，后续旋转仍绕球心。
    */
   _zoomToCursor(e) {
     e.preventDefault();
@@ -281,13 +282,13 @@ export class Globe {
 
     // 灵敏度与 OrbitControls 默认相近：向上滚（deltaY<0）放大
     const factor = Math.exp(-e.deltaY * 0.0014);
-    let newDist = THREE.MathUtils.clamp(dist * factor, this.controls.minDistance, this.controls.maxDistance);
+    const newDist = THREE.MathUtils.clamp(dist * factor, this.controls.minDistance, this.controls.maxDistance);
     if (newDist === dist) return;
-    cam.multiplyScalar(newDist / dist);
+    const base = cam.clone().multiplyScalar(newDist / dist);   // 仅视线缩进
 
-    this.camera.updateMatrixWorld();
-    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
-
+    // 计算锚点补偿向量 T（把 hit 点拉回原 NDC）
+    const T = new THREE.Vector3();
+    this._applyCam(base);
     this._ray.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
     const hit = this._ray.intersectObject(this.globe, false)[0];
     if (hit) {
@@ -296,19 +297,36 @@ export class Globe {
       if (Math.abs(dxN) > 1e-6 || Math.abs(dyN) > 1e-6) {
         const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
         const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
-        const dCam = cam.distanceTo(hit.point);
+        const dCam = base.distanceTo(hit.point);
         const halfH = Math.tan(this.camera.fov * Math.PI / 360) * dCam;   // 视口半高（世界单位）
         const halfW = halfH * this.camera.aspect;
-        cam.add(right.multiplyScalar(dxN * halfW));
-        cam.add(up.multiplyScalar(dyN * halfH));
-        const d2 = cam.length() || 1;
-        const clamped = THREE.MathUtils.clamp(d2, this.controls.minDistance, this.controls.maxDistance);
-        cam.multiplyScalar(clamped / d2);
+        T.copy(right).multiplyScalar(dxN * halfW).addScaledVector(up, dyN * halfH);
       }
     }
+
+    // 逐级收缩补偿量：地球中心漂出视口中部就减补偿，锚定与居中取折中
+    const LIMIT = 0.55;
+    for (const f of [1, 0.7, 0.5, 0.3, 0.15, 0]) {
+      this._applyCam(base).addScaledVector(T, f);
+      const o = new THREE.Vector3(0, 0, 0).project(this.camera);
+      if (Math.abs(o.x) <= LIMIT && Math.abs(o.y) <= LIMIT) break;
+    }
+    // 距原点越界再钳一次（保持方向）
+    const d2 = cam.length() || 1;
+    const clamped = THREE.MathUtils.clamp(d2, this.controls.minDistance, this.controls.maxDistance);
+    cam.multiplyScalar(clamped / d2);
+
     this.controls.update();
     this.updateCityLod();
     this.requestRender();
+  }
+
+  /** 设定相机位姿并刷新矩阵（project / 基向量依赖） */
+  _applyCam(pos) {
+    this.camera.position.copy(pos);
+    this.camera.updateMatrixWorld();
+    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+    return this.camera.position;
   }
 
   setTexture(tex, which = 'day') {
@@ -508,6 +526,11 @@ export class Globe {
       if (!div) {
         div = document.createElement('div');
         div.className = 'globe-label';
+        div.title = '查看城市详情';
+        // 名城标签压在小城市标签之上：重叠处点击命中名城
+        div.style.zIndex = String(Math.min(2000000000, Math.round(city.population || 0)));
+        // 点名字＝点城市：直接打开城市卡片
+        div.addEventListener('click', () => this.onCityPick?.(city));
         this.labelLayer.appendChild(div);
         this._labelDivs.set(city.id, div);
       }
@@ -534,10 +557,16 @@ export class Globe {
       this._ray.params.Points.threshold = THREE.MathUtils.clamp(0.004 * dist, 0.005, 0.016);
       const cityHits = this._ray.intersectObject(this.cityPoints, false);
       if (cityHits.length > 0) {
-        // 命中按相机距离排序，但同屏重叠时应取离光标射线最近的那个
-        let best = cityHits[0];
+        // 密集城区多点重叠：取「离射线最近者」会点中小区县；
+        // 改为在贴近射线的候选（≤最近距离 ×1.3）里选人口最大的名城
+        let minRay = Infinity;
+        for (const h of cityHits) minRay = Math.min(minRay, h.distanceToRay);
+        let best = null;
+        let bestPop = -1;
         for (const h of cityHits) {
-          if (h.distanceToRay < best.distanceToRay) best = h;
+          if (h.distanceToRay > minRay * 1.3 + 1e-9) continue;
+          const pop = this.cityData[h.index]?.population || 0;
+          if (pop > bestPop) { best = h; bestPop = pop; }
         }
         const city = this.cityData[best.index];
         if (city && this.onCityPick) {
