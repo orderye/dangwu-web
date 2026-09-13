@@ -93,7 +93,7 @@ export class Globe {
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
-    this.controls.rotateSpeed = 0.45;
+    this.controls.rotateSpeed = 0.18;      // 降低旋转灵敏度，避免鼠标拖动地图过于灵敏
     this.controls.minDistance = 7 / 12;       // = 0.5833；保证 12× 档为精确倍数，8K 贴图支撑该距离观察
     this.controls.maxDistance = 7;
     this.controls.enablePan = false;
@@ -135,7 +135,7 @@ export class Globe {
     };
     const onWheel = (e) => {
       e.preventDefault();
-      const factor = Math.exp(e.deltaY * 0.0014);
+      const factor = Math.exp(e.deltaY * 0.0008);   // 降低滚轮缩放灵敏度，避免滚一下跳太远
       this.zoomBy(factor, e.clientX, e.clientY);
     };
 
