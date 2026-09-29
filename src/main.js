@@ -449,6 +449,22 @@ function loadTextureWithFallback(loader, hiUrl, loUrl) {
   return load(hiUrl).catch(() => load(loUrl));
 }
 
+/** 加载可选的高级材质贴图（云层、法线、粗糙度、海陆遮罩），失败时不阻断启动。 */
+function loadOptionalTexture(loader, url) {
+  return new Promise((res) => {
+    loader.load(
+      url,
+      (t) => {
+        t.colorSpace = THREE.LinearSRGBColorSpace;
+        t.anisotropy = globe?.renderer?.capabilities?.getMaxAnisotropy() || 1;
+        res(t);
+      },
+      undefined,
+      () => res(null)
+    );
+  });
+}
+
 function boot() {
   try {
     globe = new Globe(canvas, { onPick: openPick });
@@ -475,16 +491,25 @@ function boot() {
   renderCompareBar();
 
   const loader = new THREE.TextureLoader();
+  const loadOpt = (url) => loadOptionalTexture(loader, url);
 
-  // 并行加载贴图与城市数据
+  // 并行加载贴图与城市数据（含 Solaris 风格的大气云层、法线与海洋遮罩）
   Promise.all([
     loadTextureWithFallback(loader, 'assets/earth_day_8192.jpg', 'assets/earth_day_4096.jpg'),
     loadTextureWithFallback(loader, 'assets/earth_night_8192.jpg', 'assets/earth_night_4096.jpg'),
+    loadOpt('assets/textures/earth-cloud.webp'),
+    loadOpt('assets/textures/earth-material.webp'),
+    loadOpt('assets/textures/earth-normal.webp'),
+    loadOpt('assets/textures/earth-roughness.webp'),
     fetch('src/data/cities.json').then(r => r.ok ? r.json() : []).catch(() => []),
   ])
-    .then(([day, night, cities]) => {
+    .then(([day, night, cloud, material, normal, roughness, cities]) => {
       globe.setTexture(day, 'day');
       globe.setTexture(night, 'night');
+      if (cloud) globe.setTexture(cloud, 'cloud');
+      if (material) globe.setTexture(material, 'material');
+      if (normal) globe.setTexture(normal, 'normal');
+      if (roughness) globe.setTexture(roughness, 'roughness');
       if (Array.isArray(cities) && cities.length) {
         globe.setCities(normalizeCities(cities));
       }

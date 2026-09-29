@@ -84,4 +84,29 @@ for (const [key, source] of Object.entries(SOURCES)) {
   copyFileSync(source.file, source.output);
   console.log(`${key}: ${basename(source.output)} ${statSync(source.output).size} bytes, 8192×4096`);
 }
+
+// 增补：Solaris 风格的高级物理材质贴图（云层、海洋水体、法线起伏、粗糙度）
+const WEBP_DIR = resolve(ROOT, 'assets/textures');
+mkdirSync(WEBP_DIR, { recursive: true });
+const WEBP_SOURCES = {
+  'earth-cloud.webp': 'https://solaris.cuvii.dev/textures/v1/earth/earth-cloud.webp',
+  'earth-material.webp': 'https://solaris.cuvii.dev/textures/v1/earth/earth-material.webp',
+  'earth-normal.webp': 'https://solaris.cuvii.dev/textures/v1/earth/earth-normal.webp',
+  'earth-roughness.webp': 'https://solaris.cuvii.dev/textures/v1/earth/earth-roughness.webp',
+};
+for (const [filename, url] of Object.entries(WEBP_SOURCES)) {
+  const target = resolve(WEBP_DIR, filename);
+  if (existsSync(target)) {
+    console.log(`${filename} 已存在，跳过`);
+    continue;
+  }
+  console.log(`下载 ${filename}…`);
+  const res = spawnSync('curl', ['-fL', '--retry', '3', '-o', target, url], { stdio: 'inherit' });
+  if (res.status !== 0) {
+    console.warn(`警告：${filename} 下载失败，将使用基础双贴图降级`);
+  } else {
+    console.log(`${filename}: ${statSync(target).size} bytes`);
+  }
+}
+
 console.log(`完成，耗时 ${(performance.now() - started).toFixed(0)} ms`);

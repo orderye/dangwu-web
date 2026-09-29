@@ -11,43 +11,271 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 const VERT = /* glsl */ `
-varying vec2 vUv; varying vec3 vN;
+varying vec2 vUv;
+varying vec3 vN;
+varying vec3 vWP;
+
 void main() {
   vUv = uv;
-  vN  = normalize(mat3(modelMatrix) * normal);   // 球无缩放，世界法线即地固坐标
-  gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
+  vN = normalize(mat3(modelMatrix) * normal);
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWP = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
 }`;
 
 const FRAG = /* glsl */ `
-uniform sampler2D dayTex; uniform sampler2D nightTex; uniform vec3 sunDir;
-varying vec2 vUv; varying vec3 vN;
+precision highp float;
+
+uniform sampler2D dayTex;
+uniform sampler2D nightTex;
+uniform sampler2D cloudTex;
+uniform sampler2D normalTex;
+uniform sampler2D roughnessTex;
+uniform sampler2D materialTex;
+
+uniform float hasClouds;
+uniform float hasNormal;
+uniform float hasRoughness;
+uniform float hasMaterial;
+
+uniform vec3 sunDir;
+uniform float uTime;
+uniform float uCloudOffset;
+uniform float oceanGlint;
+uniform float oceanWaveStrength;
+uniform float cloudShadowIntensity;
+
+varying vec2 vUv;
+varying vec3 vN;
+varying vec3 vWP;
+
+#define PI 3.141592653589793
+
+// 菲涅尔反射 (Schlick 近似)
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+  return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// GGX 法线分布函数
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+  float a = roughness * roughness;
+  float a2 = a * a;
+  float NdotH = max(dot(N, H), 0.0);
+  float denom = (NdotH * NdotH * (a2 - 1.0) + 1.0);
+  return a2 / max(PI * denom * denom, 0.0001);
+}
+
+// Schlick-GGX 几何遮蔽函数
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+  float r = roughness + 1.0;
+  float k = (r * r) / 8.0;
+  float NdotV = max(dot(N, V), 0.0);
+  float NdotL = max(dot(N, L), 0.0);
+  float gV = NdotV / max(NdotV * (1.0 - k) + k, 0.0001);
+  float gL = NdotL / max(NdotL * (1.0 - k) + k, 0.0001);
+  return gV * gL;
+}
+
+// 海面多频简谐波法线扰动 (借鉴 Solaris oceanWaveSlope)
+vec2 oceanWaveSlope(vec2 uv) {
+  float f1 = (uv.x * 96.0 + uv.y * 41.0) * 2.0 * PI + uTime * 0.72;
+  float f2 = (uv.x * -157.0 + uv.y * 73.0) * 2.0 * PI - uTime * 0.51;
+  float f3 = (uv.x * 53.0 + uv.y * 137.0) * 2.0 * PI + uTime * 0.34;
+  vec2 slope =
+    vec2(0.72, 0.31) * cos(f1) +
+    vec2(-0.46, 0.83) * cos(f2) * 0.62 +
+    vec2(0.28, -0.91) * cos(f3) * 0.34;
+  return slope;
+}
+
+// ACES Filmic 电影色调映射
+vec3 filmic(vec3 color) {
+  color = max(color, 0.0);
+  return clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
+}
+
 void main() {
-  vec3 n = normalize(vN);
-  float c = dot(n, normalize(sunDir));
-  float k = smoothstep(-0.09, 0.09, c);                       // 晨昏过渡带 ≈ ±5.7°
-  vec3 day   = texture2D(dayTex, vUv).rgb;
-  vec3 night = texture2D(nightTex, vUv).rgb * 1.1 + 0.012;    // 城市灯光略提亮
-  vec3 col   = mix(night, day * (0.35 + 0.65 * clamp(c * 1.6, 0.0, 1.0)), k);
-  col += vec3(1.0, 0.78, 0.35) * (1.0 - smoothstep(0.0, 0.02, abs(c))) * 0.35;  // 晨昏线描金
-  gl_FragColor = vec4(pow(col, vec3(0.4545)), 1.0);           // 近似 gamma 输出
+  vec3 N = normalize(vN);
+  vec3 V = normalize(cameraPosition - vWP);
+  vec3 L = normalize(sunDir);
+
+  // 切线空间计算 (用于法线贴图与水面波浪)
+  vec3 tCand = vec3(N.z, 0.0, -N.x);
+  vec3 T = length(tCand) > 0.001 ? normalize(tCand) : vec3(1.0, 0.0, 0.0);
+  vec3 B = normalize(cross(N, T));
+
+  vec3 shadingN = N;
+  if (hasNormal > 0.5) {
+    vec3 mapN = texture2D(normalTex, vUv).xyz * 2.0 - 1.0;
+    mapN.xy *= 0.35;
+    shadingN = normalize(T * mapN.x + B * mapN.y + N * mapN.z);
+  }
+
+  // 基础贴图读取
+  vec3 dayCol = texture2D(dayTex, vUv).rgb;
+  vec3 nightCol = texture2D(nightTex, vUv).rgb;
+
+  // 粗糙度与水体遮罩
+  float roughness = 0.82;
+  if (hasRoughness > 0.5) {
+    roughness = texture2D(roughnessTex, vUv).r;
+  }
+  float oceanMask = 0.0;
+  if (hasMaterial > 0.5) {
+    oceanMask = smoothstep(0.1, 0.85, texture2D(materialTex, vUv).r);
+  } else {
+    // 无专门材质遮罩时，根据白天反射与粗糙度推导水体 (深蓝水面反射低、粗糙度极低)
+    oceanMask = smoothstep(0.45, 0.15, roughness);
+  }
+
+  // 海面波浪扰动与高光特性
+  if (oceanMask > 0.01) {
+    vec2 wave = oceanWaveSlope(vUv * vec2(360.0, 180.0));
+    vec3 waveN = normalize(N - T * wave.x * oceanWaveStrength * 0.03 - B * wave.y * oceanWaveStrength * 0.03);
+    shadingN = normalize(mix(shadingN, waveN, oceanMask));
+    roughness = mix(roughness, 0.08, oceanMask);
+  }
+
+  // 光照角与物理大气衰减 (Rayleigh 色散)
+  float NdotL = dot(shadingN, L);
+  float directCosine = max(NdotL, 0.0);
+
+  // 晨昏线物理消光 (大气斜向厚度随太阳天顶角递增，蓝色最先被滤掉，留下金红色夕阳)
+  float opticalPath = clamp((1.0 / max(NdotL + 0.12, 0.001)) - 0.9, 0.0, 5.0);
+  vec3 rayleighExtinction = exp(-vec3(0.14, 0.40, 1.10) * opticalPath);
+  vec3 sunLightColor = mix(vec3(1.0, 0.42, 0.14), vec3(1.0, 0.97, 0.92), smoothstep(-0.02, 0.35, NdotL));
+  vec3 directSun = sunLightColor * rayleighExtinction * clamp(NdotL * 2.2, 0.0, 1.0);
+
+  // 漫反射地表颜色
+  vec3 daySurface = dayCol * (0.04 + 0.96 * directSun);
+
+  // 海洋镜面耀斑 (GGX Specular Sun Glint)
+  if (oceanMask > 0.01) {
+    vec3 H = normalize(V + L);
+    float D = distributionGGX(shadingN, H, roughness);
+    float G = geometrySmith(shadingN, V, L, roughness);
+    vec3 F = fresnelSchlick(max(dot(V, H), 0.0), vec3(0.021));
+    float denom = 4.0 * max(dot(shadingN, V), 0.001) * max(dot(shadingN, L), 0.001);
+    vec3 glint = (D * G * F / max(denom, 0.0001)) * sunLightColor * oceanGlint * directCosine * 3.14159;
+    daySurface += glint * oceanMask;
+  }
+
+  // 云层投影 (Cloud Shadows)
+  if (hasClouds > 0.5) {
+    vec2 cloudUv = vUv + vec2(uCloudOffset, 0.0);
+    vec2 shadowOffset = vec2(L.x, L.y) * 0.007;
+    float shadowCover = smoothstep(0.12, 0.75, texture2D(cloudTex, cloudUv + shadowOffset).r);
+    daySurface *= 1.0 - shadowCover * cloudShadowIntensity * clamp(NdotL * 2.0, 0.0, 1.0);
+  }
+
+  // 夜间城市灯光 (暖色调光谱加权 + 云层遮蔽)
+  float nightVisibility = smoothstep(0.02, -0.10, NdotL);
+  vec3 warmCity = nightCol * vec3(1.22, 0.96, 0.78) * 1.35;
+  if (hasClouds > 0.5) {
+    float cloudCover = texture2D(cloudTex, vUv + vec2(uCloudOffset, 0.0)).r;
+    warmCity *= 1.0 - smoothstep(0.15, 0.85, cloudCover) * 0.65;
+  }
+  vec3 nightSurface = mix(vec3(0.0015, 0.003, 0.007), warmCity, clamp(length(nightCol) * 2.2, 0.0, 1.0));
+
+  // 昼夜平滑混合 (包含晨昏带金红漫辉)
+  float dayNightFactor = smoothstep(-0.08, 0.08, NdotL);
+  vec3 finalColor = mix(nightSurface, daySurface, dayNightFactor);
+
+  // 晨昏带微弱大地辉光 (Earthshine / Atmospheric twilight rim)
+  float twilight = (1.0 - smoothstep(0.0, 0.035, abs(NdotL))) * 0.28;
+  finalColor += vec3(1.0, 0.55, 0.22) * twilight * rayleighExtinction;
+
+  // Filmic 色调映射与高频仿噪抗断层 (Dithering)
+  float dither = (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0;
+  gl_FragColor = vec4(filmic(finalColor) + dither, 1.0);
 }`;
 
-// 大气辉光（背面渲染 + fresnel，朝太阳一侧更强）
+// 云层网格着色器 (独立半透球壳 + 银边向前散射)
+const CLOUD_VERT = /* glsl */ `
+varying vec2 vUv;
+varying vec3 vN;
+varying vec3 vWP;
+void main() {
+  vUv = uv;
+  vN = normalize(mat3(modelMatrix) * normal);
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWP = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}`;
+
+const CLOUD_FRAG = /* glsl */ `
+precision highp float;
+uniform sampler2D cloudTex;
+uniform vec3 sunDir;
+uniform float uCloudOffset;
+
+varying vec2 vUv;
+varying vec3 vN;
+varying vec3 vWP;
+
+vec3 filmic(vec3 color) {
+  color = max(color, 0.0);
+  return clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
+}
+
+void main() {
+  vec2 uv = vUv + vec2(uCloudOffset, 0.0);
+  float coverage = texture2D(cloudTex, uv).r;
+  float alpha = smoothstep(0.08, 0.85, coverage);
+  if (alpha < 0.01) discard;
+
+  vec3 N = normalize(vN);
+  vec3 V = normalize(cameraPosition - vWP);
+  vec3 L = normalize(sunDir);
+
+  float NdotL = dot(N, L);
+  float cloudLight = max(NdotL, 0.0);
+  float cloudView = max(dot(N, V), 0.0);
+
+  // 银边背光向前散射效应 (Silver Lining)
+  float silverLining = pow(1.0 - cloudView, 3.2) * smoothstep(0.0, 0.45, cloudLight);
+
+  // 夕阳/白昼阳光谱色
+  vec3 sunCol = mix(vec3(1.0, 0.55, 0.22), vec3(1.0, 0.98, 0.95), smoothstep(0.0, 0.35, NdotL));
+  vec3 dayColor = sunCol * (0.12 + cloudLight * 0.82 + silverLining * 0.38);
+  vec3 nightColor = vec3(0.008, 0.012, 0.022);
+
+  vec3 col = mix(nightColor, dayColor, smoothstep(-0.05, 0.15, NdotL));
+  gl_FragColor = vec4(filmic(col), alpha * 0.88);
+}`;
+
+// 大气外边缘辉光（背面渲染 + 物理散射与晨昏色彩）
 const ATMO_VERT = /* glsl */ `
-varying vec3 vN; varying vec3 vWP;
+varying vec3 vN;
+varying vec3 vWP;
 void main() {
   vN = normalize(mat3(modelMatrix) * normal);
   vWP = (modelMatrix * vec4(position, 1.0)).xyz;
   gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
 }`;
 const ATMO_FRAG = /* glsl */ `
+precision highp float;
 uniform vec3 sunDir;
-varying vec3 vN; varying vec3 vWP;
+varying vec3 vN;
+varying vec3 vWP;
+
 void main() {
   vec3 V = normalize(cameraPosition - vWP);
-  float rim = pow(1.0 - max(dot(normalize(vN), V), 0.0), 3.0);
-  float lit = smoothstep(-0.4, 0.3, dot(normalize(vN), normalize(sunDir)));
-  gl_FragColor = vec4(vec3(0.30, 0.55, 1.0) * rim * (0.22 + 0.78 * lit), 1.0);
+  vec3 N = normalize(vN);
+  vec3 L = normalize(sunDir);
+
+  float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+  float sunFacing = dot(N, L);
+  float lit = smoothstep(-0.35, 0.35, sunFacing);
+
+  // 晨昏线边缘朝阳侧偏金红，昼侧偏天蓝
+  vec3 atmoDay = vec3(0.25, 0.58, 1.0);
+  vec3 atmoSunset = vec3(1.0, 0.54, 0.18);
+  float sunsetZone = 1.0 - smoothstep(0.0, 0.30, abs(sunFacing));
+  vec3 atmoColor = mix(atmoDay, atmoSunset, sunsetZone * 0.72);
+
+  float alpha = rim * (0.12 + 0.88 * lit);
+  gl_FragColor = vec4(atmoColor * (0.25 + 0.75 * lit), alpha);
 }`;
 
 export const latLonToVec = (latDeg, lonDeg, r = 1) => {
@@ -209,7 +437,20 @@ export class Globe {
     this.u = {
       dayTex: { value: null },
       nightTex: { value: null },
+      cloudTex: { value: null },
+      normalTex: { value: null },
+      roughnessTex: { value: null },
+      materialTex: { value: null },
+      hasClouds: { value: 0 },
+      hasNormal: { value: 0 },
+      hasRoughness: { value: 0 },
+      hasMaterial: { value: 0 },
       sunDir: { value: new THREE.Vector3(1, 0, 0) },
+      uTime: { value: 0 },
+      uCloudOffset: { value: 0 },
+      oceanGlint: { value: 0.85 },
+      oceanWaveStrength: { value: 0.8 },
+      cloudShadowIntensity: { value: 0.48 },
     };
     // SphereGeometry 192×96：放大时仍保持几何圆润；清晰度主要由 8K 贴图 + anisotropy 保障
     this.globe = new THREE.Mesh(
@@ -218,15 +459,41 @@ export class Globe {
     );
     this.scene.add(this.globe);
 
+    // 云层球体网格：半径 1.006，透明混合，不写深度缓冲，禁用光线拾取
+    this.cloudMat = new THREE.ShaderMaterial({
+      uniforms: {
+        cloudTex: this.u.cloudTex,
+        sunDir: this.u.sunDir,
+        uCloudOffset: this.u.uCloudOffset,
+      },
+      vertexShader: CLOUD_VERT,
+      fragmentShader: CLOUD_FRAG,
+      transparent: true,
+      depthWrite: false,
+    });
+    this.cloudMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(1.006, 96, 48),
+      this.cloudMat,
+    );
+    this.cloudMesh.raycast = () => {};
+    this.cloudMesh.visible = false;
+    this.cloudMesh.renderOrder = 1;
+    this.scene.add(this.cloudMesh);
+
+    // 大气外边缘辉光：物理散射与晨昏色彩
     this.atmo = new THREE.Mesh(
-      new THREE.SphereGeometry(1.055, 64, 32),
+      new THREE.SphereGeometry(1.042, 64, 32),
       new THREE.ShaderMaterial({
         uniforms: { sunDir: this.u.sunDir },
-        vertexShader: ATMO_VERT, fragmentShader: ATMO_FRAG,
-        side: THREE.BackSide, transparent: true, depthWrite: false,
+        vertexShader: ATMO_VERT,
+        fragmentShader: ATMO_FRAG,
+        side: THREE.BackSide,
+        transparent: true,
+        depthWrite: false,
         blending: THREE.AdditiveBlending,
       }),
     );
+    this.atmo.raycast = () => {};
     this.scene.add(this.atmo);
 
     this.markers = new THREE.Group();
@@ -263,6 +530,12 @@ export class Globe {
   setSun(declDeg, subLonDeg) {
     const d = declDeg * Math.PI / 180, l = subLonDeg * Math.PI / 180;
     this.u.sunDir.value.set(Math.cos(d) * Math.cos(l), Math.sin(d), -Math.cos(d) * Math.sin(l));
+    const nowSec = performance.now() * 0.001;
+    this.u.uTime.value = nowSec;
+    this.u.uCloudOffset.value = (nowSec * 0.00002) % 1.0;
+    if (this.cloudMat) {
+      this.cloudMat.uniforms.uCloudOffset.value = this.u.uCloudOffset.value;
+    }
     this.requestRender();
   }
 
@@ -501,7 +774,23 @@ export class Globe {
   }
 
   setTexture(tex, which = 'day') {
-    this.u[which + 'Tex'].value = tex;
+    if (which === 'day' || which === 'night') {
+      this.u[which + 'Tex'].value = tex;
+    } else if (which === 'cloud') {
+      this.u.cloudTex.value = tex;
+      this.u.hasClouds.value = 1.0;
+      if (this.cloudMat) this.cloudMat.uniforms.cloudTex.value = tex;
+      if (this.cloudMesh) this.cloudMesh.visible = true;
+    } else if (which === 'normal') {
+      this.u.normalTex.value = tex;
+      this.u.hasNormal.value = 1.0;
+    } else if (which === 'roughness') {
+      this.u.roughnessTex.value = tex;
+      this.u.hasRoughness.value = 1.0;
+    } else if (which === 'material') {
+      this.u.materialTex.value = tex;
+      this.u.hasMaterial.value = 1.0;
+    }
     this.requestRender();
   }
 
@@ -557,6 +846,15 @@ export class Globe {
   render() {
     if (!this.needsRender) return;
     this.needsRender = false;
+    // 交互或惯性滑动期间，实时刷新海浪时间与云层偏移
+    if (this._interacting || performance.now() < this._loopUntil) {
+      const nowSec = performance.now() * 0.001;
+      this.u.uTime.value = nowSec;
+      this.u.uCloudOffset.value = (nowSec * 0.00002) % 1.0;
+      if (this.cloudMat) {
+        this.cloudMat.uniforms.uCloudOffset.value = this.u.uCloudOffset.value;
+      }
+    }
     // 档位动画期间由 _stepZoom 推进相机到精确目标距离；
     // 此时跳过 controls.update()，否则其 damping 残留会把相机拉离动画位置。
     const zoomDone = this._zoomActive ? this._stepZoom() : false;
@@ -588,7 +886,7 @@ export class Globe {
     const colors = new Float32Array(n * 3);
     for (let i = 0; i < n; i++) {
       const city = cities[i];
-      const p = latLonToVec(city.latitude, city.longitude, 1.001);
+      const p = latLonToVec(city.latitude, city.longitude, 1.008);
       positions[i * 3] = p.x;
       positions[i * 3 + 1] = p.y;
       positions[i * 3 + 2] = p.z;
@@ -621,7 +919,7 @@ export class Globe {
     });
 
     this.cityPoints = new THREE.Points(geo, this.cityMat);
-    this.cityPoints.renderOrder = 1;  // 在地球之上
+    this.cityPoints.renderOrder = 2;  // 在地球与云层之上
     this.scene.add(this.cityPoints);
     // 数据已更换：丢弃旧标签（数据按人口降序，标签扫描依赖该顺序）
     for (const div of this._labelDivs.values()) div.remove();

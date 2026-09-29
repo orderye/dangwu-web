@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v6';   // v6：移动端适配（捏合缩放、横排放大条、PWA 增强）
+const CACHE_VERSION = 'v7';   // v7：引入 Solaris 拟真物理大气、云层阴影与海洋波光耀斑
 const CORE_CACHE = `dangwu-${CACHE_VERSION}-core`;
 const ASSET_CACHE = `dangwu-${CACHE_VERSION}-assets`;
 const GEOCODE_CACHE = `dangwu-${CACHE_VERSION}-geocode`;
@@ -26,6 +26,10 @@ const CORE_ASSETS = [
   './vendor/three/addons/controls/OrbitControls.js',
   './assets/earth_day_4096.jpg',
   './assets/earth_night_4096.jpg',
+  './assets/textures/earth-cloud.webp',
+  './assets/textures/earth-material.webp',
+  './assets/textures/earth-normal.webp',
+  './assets/textures/earth-roughness.webp',
   // 8K 贴图（约 7.6MB）体积过大，不进安装预缓存；首次在线访问时
   // 由下方 fetch 处理器运行时缓存进 ASSET_CACHE，离线后仍可用。
   './icons/icon-192.png',

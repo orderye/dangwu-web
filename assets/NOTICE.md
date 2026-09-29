@@ -12,11 +12,16 @@ https://science.nasa.gov/earth/earth-observatory/
 
 - `earth_day_8192.jpg`（8192×4096）—— 高分辨率白昼贴图
 - `earth_night_8192.jpg`（8192×4096）—— 高分辨率夜灯贴图
+- `textures/earth-cloud.webp` —— 云层覆盖图
+- `textures/earth-material.webp` —— 海洋水体遮罩图
+- `textures/earth-normal.webp` —— 切线空间法线起伏图
+- `textures/earth-roughness.webp` —— 地表粗糙度图
 
-两者由 `tools/build-textures.mjs` 从 Solar System Scope 纹理库下载，
-依 CC BY 4.0 使用（署名：Solar System Scope）：
+以上影像源自 Solar System Scope 纹理库，依 CC BY 4.0 使用（署名：Solar System Scope）：
 https://www.solarsystemscope.com/textures/
-校验和见脚本内 `SOURCES` 定义。
+地球物理散射模型、海洋波光耀斑（GGX Glint）与云层投影算法参考并改进自 Solaris（Cuvii，MIT 协议）：
+https://github.com/thecuvii/solaris
+https://solaris.cuvii.dev/earth/
 
 ## 离线城市索引
 `src/data/cities.json` 由 `tools/build-cities.mjs` 从 GeoNames `cities15000` 与
